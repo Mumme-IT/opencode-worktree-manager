@@ -1,0 +1,63 @@
+{
+  "name": "opencode-worktree-manager",
+  "version": "0.1.0",
+  "description": "OpenCode plugin — git worktree management with TUI sidebar status panel",
+  "keywords": [
+    "opencode",
+    "plugin",
+    "git",
+    "worktree",
+    "tui"
+  ],
+  "license": "MIT",
+  "author": "Mumme-IT",
+  "type": "module",
+  "main": "./dist/server.js",
+  "exports": {
+    ".": {
+      "import": "./dist/server.js"
+    },
+    "./server": {
+      "import": "./dist/server.js"
+    },
+    "./tui": {
+      "import": "./dist/tui.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "bun run build:server && bun run build:tui",
+    "build:server": "bun build src/server.ts --outdir dist --target node --entry-naming \"server.[ext]\" --external @opencode-ai/plugin --external @opencode-ai/sdk",
+    "build:tui": "bun run build-tui.ts",
+    "postbuild": "mkdir -p .opencode/plugins && cp dist/server.js .opencode/plugins/worktree-manager.js",
+    "dev": "bun run build --watch"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.0.0",
+    "@opentui/core": ">=0.2.6",
+    "@opentui/solid": ">=0.2.6",
+    "solid-js": "*"
+  },
+  "peerDependenciesMeta": {
+    "@opentui/core": {
+      "optional": true
+    },
+    "@opentui/solid": {
+      "optional": true
+    },
+    "solid-js": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.4.6",
+    "@opentui/solid": ">=0.2.6",
+    "@types/bun": "^1.2.0",
+    "solid-js": "^1.9.0",
+    "typescript": "^5.8.0"
+  }
+}
