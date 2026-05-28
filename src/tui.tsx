@@ -192,6 +192,7 @@ function WorktreeList(props: { api: TuiPluginApi; sessionID?: string }) {
 
   const worktrees = createMemo(() => viewState.state().worktrees)
   const current = createMemo(() => getCurrentWorktree(worktrees(), viewState.currentDirectory(), viewState.currentBranch()))
+  const canToggle = createMemo(() => worktrees().length > 0)
   const visibleWorktrees = createMemo(() => (open() ? worktrees() : current() ? [current()!] : []))
   const isCurrent = (entry: WorktreeEntry) => {
     return current()?.path === entry.path
@@ -211,10 +212,10 @@ function WorktreeList(props: { api: TuiPluginApi; sessionID?: string }) {
         <box
           flexDirection="row"
           gap={1}
-          onMouseDown={() => worktrees().length > 1 && setOpen((x) => !x)}
+          onMouseDown={() => canToggle() && setOpen((x) => !x)}
         >
-        <Show when={worktrees().length > 1}>
-          <text fg={theme().text}>{open() ? "▼" : "▶"}</text>
+        <Show when={canToggle()}>
+          <text fg={theme().text}>{open() ? "[-]" : "[+]"}</text>
         </Show>
         <text fg={theme().text}>
           <b>Worktrees</b>

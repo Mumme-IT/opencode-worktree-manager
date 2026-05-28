@@ -137,6 +137,47 @@ function getWorktreeSiblingPath(repoRoot: string, branch: string): string {
   return join(parentDir, `${repoName}-worktrees`, branch)
 }
 
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`
+}
+
+function branchExists(cwd: string, branch: string): boolean {
+  try {
+    git(`show-ref --verify --quiet ${shellQuote(`refs/heads/${branch}`)}`, cwd)
+    return true
+  } catch {
+    return false
+  }
+}
+
+function findCheckedOutBranch(cwd: string, branch: string): { path: string; branch: string } | undefined {
+  return listGitWorktrees(cwd).find((worktree) => worktree.branch === branch)
+}
+
+function addWorktree(repoRoot: string, branch: string, worktreePath: string, base?: string): void {
+  mkdirSync(join(worktreePath, ".."), { recursive: true })
+  if (branchExists(repoRoot, branch)) {
+    const checkedOut = findCheckedOutBranch(repoRoot, branch)
+    if (checkedOut) {
+      throw new Error(`Branch '${branch}' is already checked out at ${checkedOut.path}.`)
+    }
+    git(`worktree add ${shellQuote(worktreePath)} ${shellQuote(branch)}`, repoRoot)
+    return
+  }
+
+  git(`worktree add -b ${shellQuote(branch)} ${shellQuote(worktreePath)} ${shellQuote(base ?? "HEAD")}`, repoRoot)
+}
+
+function trackWorktree(state: WorktreeState, entry: WorktreeEntry): WorktreeEntry {
+  const existing = state.worktrees.find((worktree) => worktree.path === entry.path || worktree.branch === entry.branch)
+  if (existing) {
+    Object.assign(existing, entry)
+    return existing
+  }
+  state.worktrees.push(entry)
+  return entry
+}
+
 function listGitWorktrees(cwd: string): Array<{ path: string; branch: string }> {
   const output = git("worktree list --porcelain", cwd)
   const entries: Array<{ path: string; branch: string }> = []
@@ -221,8 +262,7 @@ function createWorktreeWorkspaceAdapter(projectDir: string): WorkspaceAdapter & 
 
       const repoRoot = getRepoRoot(projectDir)
       const base = from?.branch || getCurrentBranch(repoRoot)
-      mkdirSync(join(config.directory, ".."), { recursive: true })
-      git(`worktree add -b ${config.branch} "${config.directory}" ${base}`, repoRoot)
+      addWorktree(repoRoot, config.branch, config.directory, base)
     },
 
     async remove(config) {
@@ -239,16 +279,18 @@ function createWorktreeWorkspaceAdapter(projectDir: string): WorkspaceAdapter & 
 
 // --- Tools ---
 
-function createWorktreeCreateTool(projectDir: string) {
+function createWorktreeCreateTool(projectDir: string, inProcessFetch: typeof globalThis.fetch, baseUrl: string) {
   return tool({
     description:
       "Create a new git worktree for isolated development. " +
       "Creates branch + worktree in sibling directory. " +
+      "Switches to the new worktree by default unless switch is false. " +
       "Returns the worktree path for subsequent operations.",
     args: {
       branch: tool.schema.string().describe("Branch name to create (e.g. feature/dark-mode)"),
       baseBranch: tool.schema.string().optional().describe("Base branch (defaults to current HEAD)"),
       story: tool.schema.string().optional().describe("Story/ticket reference (e.g. #256, PROJ-123)"),
+      switch: tool.schema.boolean().optional().describe("Switch to the new worktree after creating it (defaults to true)"),
     },
     async execute(args, ctx) {
       ctx.metadata({ title: `worktree: create ${args.branch}` })
@@ -261,13 +303,15 @@ function createWorktreeCreateTool(projectDir: string) {
         return `Worktree already exists at ${wtPath}. Use worktree_switch to activate it.`
       }
 
-      // Create worktree with new branch
-      mkdirSync(join(wtPath, ".."), { recursive: true })
-      git(`worktree add -b ${args.branch} "${wtPath}" ${base}`, repoRoot)
+      try {
+        addWorktree(repoRoot, args.branch, wtPath, base)
+      } catch (error) {
+        return error instanceof Error ? error.message : String(error)
+      }
 
       // Update state
       const state = loadState(repoRoot)
-      state.worktrees.push({
+      trackWorktree(state, {
         branch: args.branch,
         path: wtPath,
         story: args.story,
@@ -276,6 +320,18 @@ function createWorktreeCreateTool(projectDir: string) {
       })
       saveState(state)
 
+      const shouldSwitch = args.switch !== false
+      if (shouldSwitch) {
+        scheduleWorktreeSessionSwitch({
+          branch: args.branch,
+          path: wtPath,
+          sessionID: ctx.sessionID,
+          projectDir,
+          baseUrl,
+          fetch: inProcessFetch,
+        })
+      }
+
       return [
         `Worktree created:`,
         `  Branch: ${args.branch}`,
@@ -283,7 +339,9 @@ function createWorktreeCreateTool(projectDir: string) {
         `  Base: ${base}`,
         args.story ? `  Story: ${args.story}` : "",
         ``,
-        `Use workdir="${wtPath}" in Bash tool calls to operate in this worktree.`,
+        shouldSwitch
+          ? `Session switch scheduled. Stop here; continuation resumes in the forked worktree session.`
+          : `Use workdir="${wtPath}" in Bash tool calls to operate in this worktree.`,
       ]
         .filter(Boolean)
         .join("\n")
@@ -389,15 +447,46 @@ function createWorktreeSwitchTool(projectDir: string, inProcessFetch: typeof glo
 
       const repoRoot = getRepoRoot(projectDir)
       const state = loadState(repoRoot)
-      const entry = state.worktrees.find((e) => e.branch === args.branch)
+      let entry = state.worktrees.find((e) => e.branch === args.branch)
 
       if (!entry) {
-        const available = state.worktrees.map((e) => e.branch).join(", ")
-        return `Worktree '${args.branch}' not found. Available: ${available || "none"}`
+        const existingWorktree = findCheckedOutBranch(repoRoot, args.branch)
+        if (existingWorktree) {
+          entry = trackWorktree(state, {
+            branch: args.branch,
+            path: existingWorktree.path,
+            createdAt: new Date().toISOString(),
+          })
+        }
+      }
+
+      if (!entry) {
+        if (!branchExists(repoRoot, args.branch)) {
+          const available = state.worktrees.map((e) => e.branch).join(", ")
+          return `Worktree '${args.branch}' not found. Available: ${available || "none"}`
+        }
+
+        const wtPath = getWorktreeSiblingPath(repoRoot, args.branch)
+        if (existsSync(wtPath)) return `Worktree path ${wtPath} already exists.`
+
+        try {
+          addWorktree(repoRoot, args.branch, wtPath)
+        } catch (error) {
+          return error instanceof Error ? error.message : String(error)
+        }
+        entry = trackWorktree(state, {
+          branch: args.branch,
+          path: wtPath,
+          createdAt: new Date().toISOString(),
+        })
       }
 
       if (!existsSync(entry.path)) {
-        return `Worktree path ${entry.path} no longer exists. Remove with worktree_finish.`
+        try {
+          addWorktree(repoRoot, args.branch, entry.path)
+        } catch (error) {
+          return error instanceof Error ? error.message : String(error)
+        }
       }
 
       scheduleWorktreeSessionSwitch({
@@ -548,7 +637,7 @@ const WorktreeManagerPlugin = async (input: PluginInput) => {
     },
 
     tool: {
-      worktree_create: createWorktreeCreateTool(projectDir),
+      worktree_create: createWorktreeCreateTool(projectDir, inProcessFetch, baseUrl),
       worktree_list: createWorktreeListTool(projectDir),
       worktree_switch: createWorktreeSwitchTool(projectDir, inProcessFetch, baseUrl),
       worktree_status: createWorktreeStatusTool(projectDir),

@@ -1,7 +1,19 @@
 {
   "name": "opencode-worktree-manager",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "OpenCode plugin — git worktree management with TUI sidebar status panel",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Mumme-IT/opencode-worktree-manager.git"
+  },
+  "homepage": "https://github.com/Mumme-IT/opencode-worktree-manager#readme",
+  "bugs": {
+    "url": "https://github.com/Mumme-IT/opencode-worktree-manager/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "keywords": [
     "opencode",
     "plugin",
@@ -34,6 +46,7 @@
     "build:server": "bun build src/server.ts --outdir dist --target node --entry-naming \"server.[ext]\" --external @opencode-ai/plugin --external @opencode-ai/sdk",
     "build:tui": "bun run build-tui.ts",
     "postbuild": "mkdir -p .opencode/plugins && cp dist/server.js .opencode/plugins/worktree-manager.js",
+    "prepublishOnly": "bun run build",
     "dev": "bun run build --watch"
   },
   "peerDependencies": {
