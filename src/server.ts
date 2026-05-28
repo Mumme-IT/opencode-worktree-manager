@@ -90,10 +90,11 @@ function syncState(state: WorktreeState, cwd: string): WorktreeState {
     // Not in a git repo or git unavailable — skip sync
     return state
   }
+  const linkedWorktrees = gitWorktrees.slice(1)
 
   const trackedByPath = new Map(state.worktrees.map((entry) => [entry.path, entry]))
 
-  state.worktrees = gitWorktrees.map((worktree) => {
+  state.worktrees = linkedWorktrees.map((worktree) => {
     const tracked = trackedByPath.get(worktree.path)
 
     return toWorktreeEntry({

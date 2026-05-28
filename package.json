@@ -1,6 +1,6 @@
 {
   "name": "opencode-worktree-manager",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "OpenCode plugin — git worktree management with TUI sidebar status panel",
   "repository": {
     "type": "git",
