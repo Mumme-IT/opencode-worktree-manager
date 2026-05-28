@@ -293,7 +293,9 @@ function createWorktreeCreateTool(projectDir: string) {
 
 function createWorktreeListTool(projectDir: string) {
   return tool({
-    description: "List all worktrees with branch, story reference, and current-session marker.",
+    description:
+      "List tracked/git worktrees with branch, story reference, and current-session marker. " +
+      "Use this before removing worktrees; do not infer current/non-current from git status or cwd alone.",
     args: {},
     async execute(_args, ctx) {
       ctx.metadata({ title: "worktree: list" })
@@ -470,7 +472,10 @@ function createWorktreeFinishTool(projectDir: string) {
     description:
       "Finish and remove a worktree. " +
       "Does NOT auto-commit — commit manually before calling this. " +
-      "Removes git worktree and cleans state.",
+      "Removes git worktree and cleans state. " +
+      "Use this instead of Bash git worktree remove/rm. " +
+      "For bulk cleanup, call worktree_list first, then call worktree_finish once per branch. " +
+      "Do not use force unless the user explicitly allows discarding changes.",
     args: {
       branch: tool.schema
         .string()
@@ -479,7 +484,7 @@ function createWorktreeFinishTool(projectDir: string) {
       force: tool.schema
         .boolean()
         .optional()
-        .describe("Force removal even with uncommitted changes"),
+        .describe("Discard uncommitted changes during removal; only set true after explicit user approval"),
     },
     async execute(args, ctx) {
       ctx.metadata({ title: `worktree: finish ${args.branch || "current"}` })
