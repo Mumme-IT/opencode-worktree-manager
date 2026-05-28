@@ -17,6 +17,8 @@ const STATUS_FILE = join(STATE_DIR, "status.json")
 const SWITCH_DELAY_MS = 0
 const SWITCH_CONTINUATION_PROMPT =
   "Worktree switch is complete. Continue the user's latest request in this worktree session. Do not call worktree_switch again."
+const ROOT_SWITCH_REQUIRED_MESSAGE =
+  "Worktree switch blocked: only the root agent can switch worktrees. Ask the root agent to switch before starting subagents for work in this worktree."
 
 interface WorktreeEntry {
   branch: string
@@ -37,6 +39,11 @@ interface WorktreeSessionSwitch {
   projectDir: string
   baseUrl: string
   fetch: typeof globalThis.fetch
+}
+
+interface SessionInfo {
+  id: string
+  parentID?: string
 }
 
 function ensureStateDir() {
@@ -285,7 +292,9 @@ function createWorktreeCreateTool(projectDir: string, inProcessFetch: typeof glo
       "Create a new git worktree for isolated development. " +
       "Creates branch + worktree in sibling directory. " +
       "Switches to the new worktree by default unless switch is false. " +
-      "Returns the worktree path for subsequent operations.",
+      "Returns the worktree path for subsequent operations. " +
+      "Root agent only: switch worktrees before starting subagents that must work there. " +
+      "Subagents must not switch worktrees; they must ask the root agent to switch first.",
     args: {
       branch: tool.schema.string().describe("Branch name to create (e.g. feature/dark-mode)"),
       baseBranch: tool.schema.string().optional().describe("Base branch (defaults to current HEAD)"),
@@ -298,6 +307,11 @@ function createWorktreeCreateTool(projectDir: string, inProcessFetch: typeof glo
       const repoRoot = getRepoRoot(projectDir)
       const base = args.baseBranch || getCurrentBranch(repoRoot)
       const wtPath = getWorktreeSiblingPath(repoRoot, args.branch)
+      const shouldSwitch = args.switch !== false
+
+      if (shouldSwitch && !(await canSwitchFromSession(baseUrl, inProcessFetch, projectDir, ctx.sessionID))) {
+        return ROOT_SWITCH_REQUIRED_MESSAGE
+      }
 
       if (existsSync(wtPath)) {
         return `Worktree already exists at ${wtPath}. Use worktree_switch to activate it.`
@@ -320,7 +334,6 @@ function createWorktreeCreateTool(projectDir: string, inProcessFetch: typeof glo
       })
       saveState(state)
 
-      const shouldSwitch = args.switch !== false
       if (shouldSwitch) {
         scheduleWorktreeSessionSwitch({
           branch: args.branch,
@@ -383,6 +396,13 @@ function scheduleWorktreeSessionSwitch(args: WorktreeSessionSwitch) {
   }, SWITCH_DELAY_MS)
 }
 
+async function canSwitchFromSession(baseUrl: string, fetch: typeof globalThis.fetch, projectDir: string, sessionID: string) {
+  const client = createV2Client({ baseUrl, fetch, directory: projectDir })
+  const result = await client.session.get({ sessionID })
+  if (result.error) throw new Error(`Session lookup failed: ${JSON.stringify(result.error)}`)
+  return !(result.data as SessionInfo).parentID
+}
+
 async function switchWorktreeSession(args: WorktreeSessionSwitch) {
   const worktreeClient = createV2Client({
     baseUrl: args.baseUrl,
@@ -438,7 +458,9 @@ function createWorktreeSwitchTool(projectDir: string, inProcessFetch: typeof glo
     description:
       "Switch current worktree context. " +
       "Forks the current session into a new session rooted in the worktree directory, " +
-      "preserving full conversation history. The TUI auto-navigates to the new session.",
+      "preserving full conversation history. The TUI auto-navigates to the new session. " +
+      "Root agent only: switch worktrees before starting subagents that must work there. " +
+      "Subagents must not switch worktrees; they must ask the root agent to switch first.",
     args: {
       branch: tool.schema.string().describe("Branch name of worktree to switch to"),
     },
@@ -448,6 +470,10 @@ function createWorktreeSwitchTool(projectDir: string, inProcessFetch: typeof glo
       const repoRoot = getRepoRoot(projectDir)
       const state = loadState(repoRoot)
       let entry = state.worktrees.find((e) => e.branch === args.branch)
+
+      if (!(await canSwitchFromSession(baseUrl, inProcessFetch, projectDir, ctx.sessionID))) {
+        return ROOT_SWITCH_REQUIRED_MESSAGE
+      }
 
       if (!entry) {
         const existingWorktree = findCheckedOutBranch(repoRoot, args.branch)
