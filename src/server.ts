@@ -14,20 +14,28 @@ if (!process.env.OPENCODE_EXPERIMENTAL_WORKSPACES) {
 
 const STATE_DIR = join(homedir(), ".local", "state", "opencode", "worktree")
 const STATUS_FILE = join(STATE_DIR, "status.json")
+const SWITCH_DELAY_MS = 0
+const SWITCH_CONTINUATION_PROMPT =
+  "Worktree switch is complete. Continue the user's latest request in this worktree session. Do not call worktree_switch again."
 
 interface WorktreeEntry {
   branch: string
   path: string
-  status: "active" | "idle"
   story?: string
   baseBranch?: string
   createdAt: string
-  workspaceID?: string
 }
 
 interface WorktreeState {
-  active?: string
   worktrees: WorktreeEntry[]
+}
+
+interface WorktreeSessionSwitch {
+  path: string
+  sessionID: string
+  projectDir: string
+  baseUrl: string
+  fetch: typeof globalThis.fetch
 }
 
 function ensureStateDir() {
@@ -38,7 +46,8 @@ function loadState(cwd?: string): WorktreeState {
   let state: WorktreeState = { worktrees: [] }
   if (existsSync(STATUS_FILE)) {
     try {
-      state = JSON.parse(readFileSync(STATUS_FILE, "utf8"))
+      const parsed = JSON.parse(readFileSync(STATUS_FILE, "utf8"))
+      state = { worktrees: (parsed.worktrees ?? []).map(toWorktreeEntry) }
     } catch {
       // corrupted — start fresh
     }
@@ -52,7 +61,18 @@ function loadState(cwd?: string): WorktreeState {
 
 function saveState(state: WorktreeState) {
   ensureStateDir()
-  writeFileSync(STATUS_FILE, JSON.stringify(state, null, 2), "utf8")
+  const worktrees = state.worktrees.map(toWorktreeEntry)
+  writeFileSync(STATUS_FILE, JSON.stringify({ worktrees }, null, 2), "utf8")
+}
+
+function toWorktreeEntry(entry: WorktreeEntry): WorktreeEntry {
+  return {
+    branch: entry.branch,
+    path: entry.path,
+    story: entry.story,
+    baseBranch: entry.baseBranch,
+    createdAt: entry.createdAt,
+  }
 }
 
 /**
@@ -79,22 +99,10 @@ function syncState(state: WorktreeState, cwd: string): WorktreeState {
       // Worktree removed externally — drop from state
       continue
     }
-    if (gitBranch !== entry.branch) {
-      // Branch changed inside worktree — update
-      if (state.active === entry.branch) {
-        state.active = gitBranch
-      }
-      entry.branch = gitBranch
-    }
-    synced.push(entry)
+    synced.push(toWorktreeEntry({ ...entry, branch: gitBranch }))
   }
 
   state.worktrees = synced
-
-  // If active points to removed entry, pick first remaining or clear
-  if (state.active && !synced.some((e) => e.branch === state.active)) {
-    state.active = synced[0]?.branch
-  }
 
   return state
 }
@@ -143,6 +151,16 @@ function listGitWorktrees(cwd: string): Array<{ path: string; branch: string }> 
     }
   }
   return entries
+}
+
+function getCurrentWorktreeEntry(state: WorktreeState, directory: string): WorktreeEntry | undefined {
+  let currentPath = directory
+  try {
+    currentPath = getRepoRoot(directory)
+  } catch {
+    // Keep provided directory if git root cannot be resolved.
+  }
+  return state.worktrees.find((entry) => entry.path === currentPath)
 }
 
 // --- Workspace adapter ---
@@ -251,12 +269,10 @@ function createWorktreeCreateTool(projectDir: string) {
       state.worktrees.push({
         branch: args.branch,
         path: wtPath,
-        status: "idle",
         story: args.story,
         baseBranch: base,
         createdAt: new Date().toISOString(),
       })
-      state.active = args.branch
       saveState(state)
 
       return [
@@ -276,7 +292,7 @@ function createWorktreeCreateTool(projectDir: string) {
 
 function createWorktreeListTool(projectDir: string) {
   return tool({
-    description: "List all active worktrees with their status, branch, and story reference.",
+    description: "List all worktrees with branch, story reference, and current-session marker.",
     args: {},
     async execute(_args, ctx) {
       ctx.metadata({ title: "worktree: list" })
@@ -284,26 +300,69 @@ function createWorktreeListTool(projectDir: string) {
       const repoRoot = getRepoRoot(projectDir)
       const gitWorktrees = listGitWorktrees(repoRoot)
       const state = loadState(repoRoot)
+      const current = getCurrentWorktreeEntry(state, ctx.directory)
 
       const lines = gitWorktrees.map((wt) => {
         const entry = state.worktrees.find((e) => e.path === wt.path)
-        const isActive = state.active === wt.branch
-        const marker = isActive ? "→" : " "
-        const status = entry?.status || "unknown"
+        const marker = entry?.path === current?.path ? "→" : " "
+        const label = entry?.path === current?.path ? " [current]" : ""
         const story = entry?.story ? ` (${entry.story})` : ""
-        return `${marker} ${wt.branch}${story} [${status}] @ ${wt.path}`
+        return `${marker} ${wt.branch}${story}${label} @ ${wt.path}`
       })
 
       if (lines.length === 0) return "No worktrees found."
-      return [`Active: ${state.active || "none"}`, "", ...lines].join("\n")
+      return [`Current: ${current?.branch || "none"}`, "", ...lines].join("\n")
     },
   })
+}
+
+function scheduleWorktreeSessionSwitch(args: WorktreeSessionSwitch) {
+  setTimeout(() => {
+    switchWorktreeSession(args).catch((error) => console.error("worktree_switch failed", error))
+  }, SWITCH_DELAY_MS)
+}
+
+async function switchWorktreeSession(args: WorktreeSessionSwitch) {
+  const worktreeClient = createV2Client({
+    baseUrl: args.baseUrl,
+    fetch: args.fetch,
+    directory: args.path,
+  })
+
+  const originalClient = createV2Client({
+    baseUrl: args.baseUrl,
+    fetch: args.fetch,
+    directory: args.projectDir,
+  })
+
+  const abortResult = await originalClient.session.abort({ sessionID: args.sessionID })
+  if (abortResult.error) console.error("worktree_switch session abort failed", abortResult.error)
+
+  const forkResult = await worktreeClient.session.fork({ sessionID: args.sessionID })
+  if (forkResult.error) throw new Error(`Fork failed: ${JSON.stringify(forkResult.error)}`)
+
+  const newSessionID = forkResult.data.id
+  const selectResult = await worktreeClient.tui.selectSession({ sessionID: newSessionID })
+  if (selectResult.error) {
+    throw new Error(`Session forked but TUI switch failed: ${JSON.stringify(selectResult.error)}; New session ID: ${newSessionID}`)
+  }
+
+  const deleteResult = await originalClient.session.delete({ sessionID: args.sessionID })
+  if (deleteResult.error) console.error("worktree_switch session cleanup failed", deleteResult.error)
+
+  const promptResult = await worktreeClient.session.prompt({
+    sessionID: newSessionID,
+    parts: [{ type: "text", text: SWITCH_CONTINUATION_PROMPT, synthetic: true }],
+  })
+  if (promptResult.error) {
+    throw new Error(`Session forked but continuation failed: ${JSON.stringify(promptResult.error)}; New session ID: ${newSessionID}`)
+  }
 }
 
 function createWorktreeSwitchTool(projectDir: string, inProcessFetch: typeof globalThis.fetch, baseUrl: string) {
   return tool({
     description:
-      "Switch active worktree context. " +
+      "Switch current worktree context. " +
       "Forks the current session into a new session rooted in the worktree directory, " +
       "preserving full conversation history. The TUI auto-navigates to the new session.",
     args: {
@@ -325,142 +384,20 @@ function createWorktreeSwitchTool(projectDir: string, inProcessFetch: typeof glo
         return `Worktree path ${entry.path} no longer exists. Remove with worktree_finish.`
       }
 
-      // Mark previous as idle, new as active
-      for (const wt of state.worktrees) {
-        if (wt.branch === state.active) wt.status = "idle"
-      }
-      entry.status = "active"
-      state.active = args.branch
-
-      // V2 client for workspace operations
-      const v2 = createV2Client({
+      scheduleWorktreeSessionSwitch({
+        path: entry.path,
+        sessionID: ctx.sessionID,
+        projectDir,
         baseUrl,
         fetch: inProcessFetch,
-        directory: projectDir,
       })
-
-      // Always do fresh workspace lookup (cached IDs may be stale across restarts)
-      let workspaceId: string | undefined
-      const diag: string[] = []
-
-      // Find workspace by directory — use existing one (startup-discovered has proper TUI status)
-      try {
-        const listResult = await v2.experimental.workspace.list({})
-        if (!listResult.error) {
-          const workspaces = listResult.data ?? []
-          diag.push(`workspaces: ${workspaces.length} total`)
-          const match = workspaces.find((ws: any) => ws.directory === entry.path)
-          if (match) {
-            workspaceId = match.id
-            diag.push(`matched: id=${match.id} name=${match.name}`)
-          }
-        }
-      } catch (err: any) {
-        diag.push(`list threw: ${err.message}`)
-      }
-
-      // If not found, syncList discovers via adapter.list()
-      if (!workspaceId) {
-        try {
-          await v2.experimental.workspace.syncList({})
-          diag.push(`syncList OK`)
-          const listResult = await v2.experimental.workspace.list({})
-          if (!listResult.error) {
-            const match = (listResult.data ?? []).find((ws: any) => ws.directory === entry.path)
-            if (match) {
-              workspaceId = match.id
-              diag.push(`matched after sync: id=${match.id} name=${match.name}`)
-            }
-          }
-        } catch (err: any) {
-          diag.push(`syncList failed: ${err.message}`)
-        }
-      }
-
-      if (!workspaceId) {
-        // Last resort: create workspace directly (may fail on auth.all)
-        try {
-          const createResult = await v2.experimental.workspace.create({
-            type: "worktree",
-            branch: args.branch,
-          })
-          if (createResult.error) {
-            diag.push(`create failed: ${JSON.stringify(createResult.error)} (${createResult.response?.status})`)
-          } else {
-            workspaceId = createResult.data?.id
-            diag.push(`created: ${workspaceId}`)
-          }
-        } catch (err: any) {
-          diag.push(`create threw: ${err.message}`)
-        }
-      }
-
-      if (!workspaceId) {
-        saveState(state)
-        return [
-          `Could not find or create workspace for branch ${args.branch}`,
-          `Path: ${entry.path}`,
-          `Use workdir="${entry.path}" in Bash tool calls as fallback.`,
-        ].join("\n")
-      }
-
-      // Ensure workspace sync is running BEFORE warp (sets status "connected")
-      let syncError1: string | undefined
-      try {
-        const syncRes = await v2.sync.start({})
-        if (syncRes.error) syncError1 = `sync.start pre-warp: ${JSON.stringify(syncRes.error)} (${syncRes.response?.status})`
-      } catch (err: any) {
-        syncError1 = `sync.start pre-warp threw: ${err.message}`
-      }
-
-      // Warp session into workspace
-      entry.workspaceID = workspaceId
-      try {
-        const warpResult = await v2.experimental.workspace.warp({
-          id: workspaceId,
-          sessionID: ctx.sessionID,
-          copyChanges: true,
-        })
-        if (warpResult.error) {
-          saveState(state)
-          return [
-            `Warp failed: ${JSON.stringify(warpResult.error)}`,
-            `  status: ${warpResult.response?.status}`,
-            `  workspace: ${workspaceId}`,
-            `Path: ${entry.path}`,
-            `Use workdir="${entry.path}" in Bash tool calls as fallback.`,
-          ].join("\n")
-        }
-      } catch (err: any) {
-        saveState(state)
-        return [
-          `Warp threw: ${err.message}`,
-          `  workspace: ${workspaceId}`,
-          `Path: ${entry.path}`,
-          `Use workdir="${entry.path}" in Bash tool calls as fallback.`,
-        ].join("\n")
-      }
-
-      // Start workspace sync again after warp (workspace now has active session)
-      let syncError2: string | undefined
-      try {
-        const syncRes2 = await v2.sync.start({})
-        if (syncRes2.error) syncError2 = `sync.start post-warp: ${JSON.stringify(syncRes2.error)} (${syncRes2.response?.status})`
-      } catch (err: any) {
-        syncError2 = `sync.start post-warp threw: ${err.message}`
-      }
 
       saveState(state)
       const lines = [
         `Switched to worktree: ${args.branch}`,
         `Path: ${entry.path}`,
         entry.story ? `Story: ${entry.story}` : "",
-        `Session warped into workspace ${workspaceId}`,
-        syncError1 ? `⚠ ${syncError1}` : "",
-        syncError2 ? `⚠ ${syncError2}` : "",
-        `--- diag ---`,
-        ...diag,
-        `All tools now operate in ${entry.path}.`,
+        `Session switch scheduled. Stop here; continuation resumes in the forked worktree session.`,
       ]
       return lines.filter(Boolean).join("\n")
     },
@@ -469,21 +406,22 @@ function createWorktreeSwitchTool(projectDir: string, inProcessFetch: typeof glo
 
 function createWorktreeStatusTool(projectDir: string) {
   return tool({
-    description: "Get detailed status of active worktree: branch, dirty files, commits ahead.",
+    description: "Get detailed status of a worktree: branch, dirty files, commits ahead.",
     args: {
       branch: tool.schema
         .string()
         .optional()
-        .describe("Branch to check (defaults to active worktree)"),
+        .describe("Branch to check (defaults to current worktree)"),
     },
     async execute(args, ctx) {
       ctx.metadata({ title: "worktree: status" })
 
       const repoRoot = getRepoRoot(projectDir)
       const state = loadState(repoRoot)
-      const targetBranch = args.branch || state.active
+      const current = getCurrentWorktreeEntry(state, ctx.directory)
+      const targetBranch = args.branch || current?.branch
 
-      if (!targetBranch) return "No active worktree. Use worktree_create or worktree_switch."
+      if (!targetBranch) return "No current worktree. Pass branch, or use worktree_switch."
 
       const entry = state.worktrees.find((e) => e.branch === targetBranch)
       if (!entry) return `Worktree '${targetBranch}' not tracked.`
@@ -522,20 +460,21 @@ function createWorktreeFinishTool(projectDir: string) {
       branch: tool.schema
         .string()
         .optional()
-        .describe("Branch to finish (defaults to active worktree)"),
+        .describe("Branch to finish (defaults to current worktree)"),
       force: tool.schema
         .boolean()
         .optional()
         .describe("Force removal even with uncommitted changes"),
     },
     async execute(args, ctx) {
-      ctx.metadata({ title: `worktree: finish ${args.branch || "active"}` })
+      ctx.metadata({ title: `worktree: finish ${args.branch || "current"}` })
 
       const repoRoot = getRepoRoot(projectDir)
       const state = loadState(repoRoot)
-      const targetBranch = args.branch || state.active
+      const current = getCurrentWorktreeEntry(state, ctx.directory)
+      const targetBranch = args.branch || current?.branch
 
-      if (!targetBranch) return "No active worktree to finish."
+      if (!targetBranch) return "No current worktree to finish. Pass branch to finish a tracked worktree."
 
       const entry = state.worktrees.find((e) => e.branch === targetBranch)
       if (!entry) return `Worktree '${targetBranch}' not tracked.`
@@ -559,9 +498,6 @@ function createWorktreeFinishTool(projectDir: string) {
 
       // Update state
       state.worktrees = state.worktrees.filter((e) => e.branch !== targetBranch)
-      if (state.active === targetBranch) {
-        state.active = state.worktrees[0]?.branch
-      }
       saveState(state)
 
       return `Worktree '${targetBranch}' removed. Branch still exists for merge/PR.`
@@ -597,31 +533,6 @@ const WorktreeManagerPlugin = async (input: PluginInput) => {
       worktree_switch: createWorktreeSwitchTool(projectDir, inProcessFetch, baseUrl),
       worktree_status: createWorktreeStatusTool(projectDir),
       worktree_finish: createWorktreeFinishTool(projectDir),
-    },
-
-    "experimental.chat.system.transform": async (_input: any, output: any) => {
-      let repoRoot: string | undefined
-      try {
-        repoRoot = getRepoRoot(projectDir)
-      } catch {
-        // Not in git repo
-      }
-      const state = loadState(repoRoot)
-      if (!state.active) return
-
-      const entry = state.worktrees.find((e) => e.branch === state.active)
-      if (!entry) return
-
-      const lines = [
-        `<system-reminder>`,
-        `ACTIVE WORKTREE: ${entry.branch}${entry.story ? ` (${entry.story})` : ""}`,
-        `Path: ${entry.path}`,
-        `Use workdir="${entry.path}" for all Bash operations in this worktree.`,
-        `When reporting status or results, mention you are working in worktree "${entry.branch}".`,
-        `</system-reminder>`,
-      ]
-
-      output.system.push(lines.join("\n"))
     },
   }
 }
