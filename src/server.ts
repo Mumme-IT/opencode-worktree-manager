@@ -79,7 +79,8 @@ function toWorktreeEntry(entry: WorktreeEntry): WorktreeEntry {
 /**
  * Reconcile tracked state with actual git worktrees.
  * Matches by path (immutable), updates branch names from git reality,
- * prunes entries whose worktree path no longer exists in git.
+ * prunes entries whose worktree path no longer exists in git,
+ * and discovers externally-created worktrees so TUI state matches git.
  */
 function syncState(state: WorktreeState, cwd: string): WorktreeState {
   let gitWorktrees: Array<{ path: string; branch: string }>
@@ -90,20 +91,18 @@ function syncState(state: WorktreeState, cwd: string): WorktreeState {
     return state
   }
 
-  const gitByPath = new Map(gitWorktrees.map((wt) => [wt.path, wt.branch]))
+  const trackedByPath = new Map(state.worktrees.map((entry) => [entry.path, entry]))
 
-  // Update branch names + prune entries with no matching git worktree
-  const synced: WorktreeEntry[] = []
-  for (const entry of state.worktrees) {
-    const gitBranch = gitByPath.get(entry.path)
-    if (gitBranch === undefined) {
-      // Worktree removed externally — drop from state
-      continue
-    }
-    synced.push(toWorktreeEntry({ ...entry, branch: gitBranch }))
-  }
+  state.worktrees = gitWorktrees.map((worktree) => {
+    const tracked = trackedByPath.get(worktree.path)
 
-  state.worktrees = synced
+    return toWorktreeEntry({
+      ...tracked,
+      branch: worktree.branch,
+      path: worktree.path,
+      createdAt: tracked?.createdAt ?? new Date().toISOString(),
+    })
+  })
 
   return state
 }
@@ -621,6 +620,7 @@ const WorktreeManagerPlugin = async (input: PluginInput) => {
 
   // Register workspace adapter — includes list() for syncList discovery
   experimental_workspace.register("worktree", createWorktreeWorkspaceAdapter(projectDir) as any)
+  loadState(projectDir)
 
   // Extract in-process fetch from V1 client (opencode injects Server.Default().app.fetch)
   const v1Internal = (client as any)._client ?? (client as any).client
