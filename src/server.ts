@@ -31,6 +31,7 @@ interface WorktreeState {
 }
 
 interface WorktreeSessionSwitch {
+  branch: string
   path: string
   sessionID: string
   projectDir: string
@@ -335,6 +336,8 @@ async function switchWorktreeSession(args: WorktreeSessionSwitch) {
     directory: args.projectDir,
   })
 
+  const originalSessionResult = await originalClient.session.get({ sessionID: args.sessionID })
+
   const abortResult = await originalClient.session.abort({ sessionID: args.sessionID })
   if (abortResult.error) console.error("worktree_switch session abort failed", abortResult.error)
 
@@ -342,6 +345,12 @@ async function switchWorktreeSession(args: WorktreeSessionSwitch) {
   if (forkResult.error) throw new Error(`Fork failed: ${JSON.stringify(forkResult.error)}`)
 
   const newSessionID = forkResult.data.id
+  if (!originalSessionResult.error) {
+    const title = getWorktreeSessionTitle(args.branch, originalSessionResult.data.title)
+    const updateResult = await worktreeClient.session.update({ sessionID: newSessionID, title })
+    if (updateResult.error) console.error("worktree_switch session title update failed", updateResult.error)
+  }
+
   const selectResult = await worktreeClient.tui.selectSession({ sessionID: newSessionID })
   if (selectResult.error) {
     throw new Error(`Session forked but TUI switch failed: ${JSON.stringify(selectResult.error)}; New session ID: ${newSessionID}`)
@@ -357,6 +366,11 @@ async function switchWorktreeSession(args: WorktreeSessionSwitch) {
   if (promptResult.error) {
     throw new Error(`Session forked but continuation failed: ${JSON.stringify(promptResult.error)}; New session ID: ${newSessionID}`)
   }
+}
+
+function getWorktreeSessionTitle(branch: string, title: string): string {
+  const baseTitle = title.replace(/\s+\(Fork #\d+\)$/, "")
+  return `[${branch}] ${baseTitle}`
 }
 
 function createWorktreeSwitchTool(projectDir: string, inProcessFetch: typeof globalThis.fetch, baseUrl: string) {
@@ -385,6 +399,7 @@ function createWorktreeSwitchTool(projectDir: string, inProcessFetch: typeof glo
       }
 
       scheduleWorktreeSessionSwitch({
+        branch: args.branch,
         path: entry.path,
         sessionID: ctx.sessionID,
         projectDir,
