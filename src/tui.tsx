@@ -33,10 +33,27 @@ async function readWorktrees(api: TuiPluginApi): Promise<WorktreeEntry[]> {
     if (!projectDirectory) return []
 
     const directory = getMainProjectRoot(projectDirectory)
+    const workspaceWorktrees = await readWorkspaceWorktrees(api, directory)
+    if (workspaceWorktrees.length > 0) return workspaceWorktrees
 
-    const gitWorktrees = await readGitWorktrees(api, directory)
-    if (gitWorktrees.length > 0) return gitWorktrees
+    return readSdkWorktrees(api, directory)
+  } catch {
+    return []
+  }
+}
 
+async function readSdkWorktrees(api: TuiPluginApi, directory: string): Promise<WorktreeEntry[]> {
+  const worktreeClient = (api.client as any).worktree
+  if (!worktreeClient) return []
+
+  const result = await worktreeClient.list({ directory })
+  if (result?.error) return []
+
+  return ((result?.data ?? []) as SdkWorktreeInfo[]).flatMap(toSdkWorktreeEntry)
+}
+
+async function readWorkspaceWorktrees(api: TuiPluginApi, directory: string): Promise<WorktreeEntry[]> {
+  try {
     const workspaceClient = (api.client as any).experimental?.workspace
     if (!workspaceClient) return []
 
@@ -48,16 +65,6 @@ async function readWorktrees(api: TuiPluginApi): Promise<WorktreeEntry[]> {
   } catch {
     return []
   }
-}
-
-async function readGitWorktrees(api: TuiPluginApi, directory: string): Promise<WorktreeEntry[]> {
-  const worktreeClient = (api.client as any).worktree
-  if (!worktreeClient) return []
-
-  const result = await worktreeClient.list({ directory })
-  if (result?.error) return []
-
-  return ((result?.data ?? []) as SdkWorktreeInfo[]).flatMap(toSdkWorktreeEntry)
 }
 
 function toSdkWorktreeEntry(worktree: SdkWorktreeInfo): WorktreeEntry[] {

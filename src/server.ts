@@ -17,6 +17,14 @@ const SWITCH_CONTINUATION_PROMPT =
 const ROOT_SWITCH_REQUIRED_MESSAGE =
   "Worktree switch blocked: only the root agent can switch worktrees. Ask the root agent to switch before starting subagents for work in this worktree."
 const OPENCODE_DB_FILE = join(process.env.XDG_DATA_HOME ?? join(homedir(), ".local", "share"), "opencode", "opencode.db")
+const WORKTREE_TOOL_INSTRUCTIONS = [
+  "Worktree operations:",
+  "- MUST use plugin tools for normal worktree operations: worktree_create, worktree_list, worktree_switch, worktree_status, worktree_finish.",
+  "- MUST NOT run direct `git worktree add/remove/move/prune/repair/lock/unlock` when a plugin tool can perform the operation.",
+  "- Direct `git worktree` modification commands are allowed only when plugin tool capabilities are insufficient for the required operation.",
+  "- Before any allowed direct `git worktree` modification, state why plugin tools are insufficient.",
+  "- Read-only Git inspection is allowed when plugin output is insufficient for diagnosis.",
+].join("\n")
 
 interface WorktreeEntry {
   branch: string
@@ -176,7 +184,7 @@ function updateSessionLocation(sessionID: string, directory: string): void {
 
 // --- Workspace adapter ---
 
-function createWorktreeWorkspaceAdapter(projectDir: string): WorkspaceAdapter & { list: () => any[] } {
+function createWorktreeWorkspaceAdapter(projectDir: string, projectID: string): WorkspaceAdapter & { list: () => any[] } {
   return {
     name: "Git Worktree",
     description: "Workspace backed by a git worktree in a sibling directory",
@@ -210,6 +218,7 @@ function createWorktreeWorkspaceAdapter(projectDir: string): WorkspaceAdapter & 
             branch: wt.branch,
             directory: wt.directory,
             extra: null,
+            projectID,
           }))
       } catch {
         return []
@@ -552,10 +561,10 @@ function createWorktreeFinishTool(projectDir: string) {
 // --- Plugin export ---
 
 const WorktreeManagerPlugin = async (input: PluginInput) => {
-  const { client, directory: projectDir, experimental_workspace } = input
+  const { client, directory: projectDir, experimental_workspace, project } = input
 
   // Register workspace adapter — includes list() for syncList discovery
-  experimental_workspace.register("worktree", createWorktreeWorkspaceAdapter(projectDir) as any)
+  experimental_workspace.register("worktree", createWorktreeWorkspaceAdapter(projectDir, project.id) as any)
 
   // Extract in-process fetch from V1 client (opencode injects Server.Default().app.fetch)
   const v1Internal = (client as any)._client ?? (client as any).client
@@ -569,6 +578,10 @@ const WorktreeManagerPlugin = async (input: PluginInput) => {
       if (cfg.experimental.workspaces === undefined) {
         cfg.experimental.workspaces = true
       }
+    },
+
+    "experimental.chat.system.transform": async (_input: any, output: { system: string[] }) => {
+      output.system.push(WORKTREE_TOOL_INSTRUCTIONS)
     },
 
     tool: {

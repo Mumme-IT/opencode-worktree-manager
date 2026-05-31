@@ -40,7 +40,7 @@ npm install opencode-worktree-manager
 
 ## Features
 
-- **TUI sidebar** — shows active worktrees from Git-backed `worktree.list()`
+- **TUI sidebar** — shows active worktrees from server-synced Git workspace data
 - **System prompt injection** — agent always knows which worktree is active
 - **Source of truth** — Git worktrees + OpenCode session paths, no plugin state file
 - **No forced auto-commit** — you control when to commit
