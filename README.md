@@ -33,16 +33,16 @@ npm install opencode-worktree-manager
 | Tool | Description |
 |------|-------------|
 | `worktree_create` | Create worktree + branch in sibling dir |
-| `worktree_list` | List all tracked worktrees with status |
+| `worktree_list` | List Git worktrees with current marker |
 | `worktree_switch` | Switch active worktree context |
-| `worktree_status` | Dirty files, commits ahead, story ref |
+| `worktree_status` | Dirty files and commits ahead |
 | `worktree_finish` | Remove worktree (no auto-commit) |
 
 ## Features
 
-- **TUI sidebar** — shows active worktrees with branch, story, status
+- **TUI sidebar** — shows active worktrees from Git-backed `worktree.list()`
 - **System prompt injection** — agent always knows which worktree is active
-- **State file** — `~/.local/state/opencode/worktree/status.json`
+- **Source of truth** — Git worktrees + OpenCode session paths, no plugin state file
 - **No forced auto-commit** — you control when to commit
 
 ## Development

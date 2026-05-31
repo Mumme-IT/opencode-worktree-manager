@@ -4,42 +4,102 @@ import type { TuiPluginApi, TuiPluginModule, TuiPlugin } from "@opencode-ai/plug
 interface WorktreeEntry {
   branch: string
   path: string
-  story?: string
-  baseBranch?: string
-  createdAt: string
 }
 
-interface WorktreeState {
-  worktrees: WorktreeEntry[]
+interface WorkspaceInfo {
+  type?: string
+  name?: string | null
+  branch?: string | null
+  directory?: string | null
 }
 
-const STATUS_REL_PATH = "worktree/status.json"
+interface SdkWorktreeObject {
+  name?: string | null
+  branch?: string | null
+  directory?: string | null
+}
+
+type SdkWorktreeInfo = string | SdkWorktreeObject
+
+const WORKSPACE_TYPE = "worktree"
 const POLL_INTERVAL_MS = 5000
 const ROUTE_POLL_INTERVAL_MS = 100
 const SESSION_SELECT_REFRESH_MS = 100
 const STARTUP_REFRESH_DELAYS_MS = [50, 150, 300, 600, 1000]
 
-async function readState(api: TuiPluginApi): Promise<WorktreeState> {
+async function readWorktrees(api: TuiPluginApi): Promise<WorktreeEntry[]> {
   try {
-    const stateDir = api.state.path?.state
-    if (!stateDir) return { worktrees: [] }
+    const projectDirectory = api.state.path?.directory
+    if (!projectDirectory) return []
 
-    const result = await api.client.file.read({
-      path: STATUS_REL_PATH,
-      directory: stateDir,
-    })
-    const content = (result as any)?.data?.content
-    if (!content || typeof content !== "string") return { worktrees: [] }
-    const parsed = JSON.parse(content)
-    return { worktrees: parsed.worktrees ?? [] }
+    const directory = getMainProjectRoot(projectDirectory)
+
+    const gitWorktrees = await readGitWorktrees(api, directory)
+    if (gitWorktrees.length > 0) return gitWorktrees
+
+    const workspaceClient = (api.client as any).experimental?.workspace
+    if (!workspaceClient) return []
+
+    await workspaceClient.syncList({ directory })
+    const result = await workspaceClient.list({ directory })
+    if (result?.error) return []
+
+    return ((result?.data ?? []) as WorkspaceInfo[]).filter(isWorktreeWorkspace).map(toWorktreeEntry)
   } catch {
-    return { worktrees: [] }
+    return []
   }
+}
+
+async function readGitWorktrees(api: TuiPluginApi, directory: string): Promise<WorktreeEntry[]> {
+  const worktreeClient = (api.client as any).worktree
+  if (!worktreeClient) return []
+
+  const result = await worktreeClient.list({ directory })
+  if (result?.error) return []
+
+  return ((result?.data ?? []) as SdkWorktreeInfo[]).flatMap(toSdkWorktreeEntry)
+}
+
+function toSdkWorktreeEntry(worktree: SdkWorktreeInfo): WorktreeEntry[] {
+  if (typeof worktree === "string") return worktree ? [{ branch: getPathName(worktree), path: worktree }] : []
+  if (!worktree.directory) return []
+  return [{
+    branch: worktree.branch ?? worktree.name ?? getPathName(worktree.directory),
+    path: worktree.directory,
+  }]
+}
+
+function isWorktreeWorkspace(workspace: WorkspaceInfo): workspace is WorkspaceInfo & { directory: string } {
+  return workspace.type === WORKSPACE_TYPE && typeof workspace.directory === "string" && workspace.directory.length > 0
+}
+
+function toWorktreeEntry(workspace: WorkspaceInfo & { directory: string }): WorktreeEntry {
+  return {
+    branch: workspace.branch ?? workspace.name ?? getPathName(workspace.directory),
+    path: workspace.directory,
+  }
+}
+
+function getMainProjectRoot(projectRoot: string): string {
+  const parts = projectRoot.split("/").filter(Boolean)
+  const worktreeContainerIndex = getWorktreeContainerIndex(parts)
+  if (worktreeContainerIndex === -1) return projectRoot
+
+  const container = parts[worktreeContainerIndex]
+  return `/${[...parts.slice(0, worktreeContainerIndex), container.slice(0, -"-worktrees".length)].join("/")}`
+}
+
+function getWorktreeContainerIndex(parts: string[]): number {
+  for (let index = parts.length - 1; index >= 0; index--) {
+    if (parts[index].endsWith("-worktrees")) return index
+  }
+  return -1
 }
 
 function getSessionDirectory(api: TuiPluginApi, sessionID?: string): string | undefined {
   if (!sessionID) return api.state.path?.worktree ?? api.state.path?.directory
   const session = api.state.session.get(sessionID) as any
+  if (session?.workspaceID) return api.state.path?.worktree ?? session?.directory ?? session?.path
   return session?.directory ?? session?.path ?? api.state.path?.worktree ?? api.state.path?.directory
 }
 
@@ -54,7 +114,9 @@ function isPathInside(path: string | undefined, directory: string): boolean {
 }
 
 function getCurrentWorktree(worktrees: WorktreeEntry[], directory: string | undefined, branch: string | undefined) {
-  return worktrees.find((entry) => isPathInside(directory, entry.path) || entry.branch === branch)
+  const directoryMatch = worktrees.find((entry) => isPathInside(directory, entry.path))
+  if (directory || !branch) return directoryMatch
+  return worktrees.find((entry) => entry.branch === branch)
 }
 
 function getDisplayPath(path: string) {
@@ -66,19 +128,13 @@ function getPathName(path: string) {
   return path.split("/").filter(Boolean).at(-1) ?? path
 }
 
-function getParentPathName(path: string) {
-  const parts = path.split("/").filter(Boolean)
-  return parts.at(-2) ?? ""
-}
-
 function getProjectName(path: string, isWorktree: boolean) {
-  const parent = getParentPathName(path)
-  if (isWorktree && parent.endsWith("-worktrees")) return parent.slice(0, -"-worktrees".length)
+  if (isWorktree) return getPathName(getMainProjectRoot(path))
   return getPathName(path)
 }
 
 function useWorktreeViewState(api: TuiPluginApi, initialSessionID?: string) {
-  const [state, setState] = createSignal<WorktreeState>({ worktrees: [] })
+  const [worktrees, setWorktrees] = createSignal<WorktreeEntry[]>([])
   const [selectedSessionID, setSelectedSessionID] = createSignal(getRouteSessionID(api) ?? initialSessionID)
   const [currentDirectory, setCurrentDirectory] = createSignal(getSessionDirectory(api, selectedSessionID()))
   const [currentBranch, setCurrentBranch] = createSignal(api.state.vcs?.branch)
@@ -90,8 +146,7 @@ function useWorktreeViewState(api: TuiPluginApi, initialSessionID?: string) {
       sessionID = routeSessionID
     }
     setCurrentDirectory(getSessionDirectory(api, sessionID))
-    const result = await readState(api)
-    setState(result)
+    setWorktrees(await readWorktrees(api))
   }
 
   const handleSessionSelect = (sessionID: string) => {
@@ -120,7 +175,7 @@ function useWorktreeViewState(api: TuiPluginApi, initialSessionID?: string) {
   }
 
   return {
-    state,
+    worktrees,
     currentDirectory,
     currentBranch,
     refresh,
@@ -190,7 +245,7 @@ function WorktreeList(props: { api: TuiPluginApi; sessionID?: string }) {
   const [open, setOpen] = createSignal(false)
   const theme = () => props.api.theme.current
 
-  const worktrees = createMemo(() => viewState.state().worktrees)
+  const worktrees = createMemo(() => viewState.worktrees())
   const current = createMemo(() => getCurrentWorktree(worktrees(), viewState.currentDirectory(), viewState.currentBranch()))
   const canToggle = createMemo(() => worktrees().length > 0)
   const visibleWorktrees = createMemo(() => (open() ? worktrees() : current() ? [current()!] : []))
@@ -240,7 +295,6 @@ function WorktreeList(props: { api: TuiPluginApi; sessionID?: string }) {
               </text>
               <text fg={isCurrent(item) ? theme().text : theme().textMuted} wrapMode="word">
                 {item.branch}
-                {item.story ? ` (${item.story})` : ""}
                 <Show when={isCurrent(item)}>
                   <span style={{ fg: theme().textMuted }}>{" current"}</span>
                 </Show>
@@ -256,15 +310,15 @@ function WorktreeList(props: { api: TuiPluginApi; sessionID?: string }) {
 function WorktreeFooter(props: { api: TuiPluginApi; sessionID?: string }) {
   const viewState = useWorktreeViewState(props.api, props.sessionID)
   const theme = () => props.api.theme.current
-  const current = createMemo(() => getCurrentWorktree(viewState.state().worktrees, viewState.currentDirectory(), viewState.currentBranch()))
+  const current = createMemo(() => getCurrentWorktree(viewState.worktrees(), viewState.currentDirectory(), viewState.currentBranch()))
   const footer = createMemo(() => {
     const entry = current()
-    const path = entry?.path ?? props.api.state.path.directory
+    const path = entry?.path ?? viewState.currentDirectory() ?? props.api.state.path.directory
     return {
       path: getDisplayPath(path),
       branch: entry?.branch ?? props.api.state.vcs?.branch ?? "unknown",
       project: getProjectName(path, Boolean(entry)),
-      worktree: entry ? getPathName(entry.path) : "main",
+      worktree: entry?.branch ?? "main",
     }
   })
 
