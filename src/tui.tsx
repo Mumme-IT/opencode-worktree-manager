@@ -6,13 +6,6 @@ interface WorktreeEntry {
   path: string
 }
 
-interface WorkspaceInfo {
-  type?: string
-  name?: string | null
-  branch?: string | null
-  directory?: string | null
-}
-
 interface SdkWorktreeObject {
   name?: string | null
   branch?: string | null
@@ -21,7 +14,6 @@ interface SdkWorktreeObject {
 
 type SdkWorktreeInfo = string | SdkWorktreeObject
 
-const WORKSPACE_TYPE = "worktree"
 const POLL_INTERVAL_MS = 5000
 const ROUTE_POLL_INTERVAL_MS = 100
 const SESSION_SELECT_REFRESH_MS = 100
@@ -33,9 +25,6 @@ async function readWorktrees(api: TuiPluginApi): Promise<WorktreeEntry[]> {
     if (!projectDirectory) return []
 
     const directory = getMainProjectRoot(projectDirectory)
-    const workspaceWorktrees = await readWorkspaceWorktrees(api, directory)
-    if (workspaceWorktrees.length > 0) return workspaceWorktrees
-
     return readSdkWorktrees(api, directory)
   } catch {
     return []
@@ -52,21 +41,6 @@ async function readSdkWorktrees(api: TuiPluginApi, directory: string): Promise<W
   return ((result?.data ?? []) as SdkWorktreeInfo[]).flatMap(toSdkWorktreeEntry)
 }
 
-async function readWorkspaceWorktrees(api: TuiPluginApi, directory: string): Promise<WorktreeEntry[]> {
-  try {
-    const workspaceClient = (api.client as any).experimental?.workspace
-    if (!workspaceClient) return []
-
-    await workspaceClient.syncList({ directory })
-    const result = await workspaceClient.list({ directory })
-    if (result?.error) return []
-
-    return ((result?.data ?? []) as WorkspaceInfo[]).filter(isWorktreeWorkspace).map(toWorktreeEntry)
-  } catch {
-    return []
-  }
-}
-
 function toSdkWorktreeEntry(worktree: SdkWorktreeInfo): WorktreeEntry[] {
   if (typeof worktree === "string") return worktree ? [{ branch: getPathName(worktree), path: worktree }] : []
   if (!worktree.directory) return []
@@ -74,17 +48,6 @@ function toSdkWorktreeEntry(worktree: SdkWorktreeInfo): WorktreeEntry[] {
     branch: worktree.branch ?? worktree.name ?? getPathName(worktree.directory),
     path: worktree.directory,
   }]
-}
-
-function isWorktreeWorkspace(workspace: WorkspaceInfo): workspace is WorkspaceInfo & { directory: string } {
-  return workspace.type === WORKSPACE_TYPE && typeof workspace.directory === "string" && workspace.directory.length > 0
-}
-
-function toWorktreeEntry(workspace: WorkspaceInfo & { directory: string }): WorktreeEntry {
-  return {
-    branch: workspace.branch ?? workspace.name ?? getPathName(workspace.directory),
-    path: workspace.directory,
-  }
 }
 
 function getMainProjectRoot(projectRoot: string): string {
@@ -106,7 +69,6 @@ function getWorktreeContainerIndex(parts: string[]): number {
 function getSessionDirectory(api: TuiPluginApi, sessionID?: string): string | undefined {
   if (!sessionID) return api.state.path?.worktree ?? api.state.path?.directory
   const session = api.state.session.get(sessionID) as any
-  if (session?.workspaceID) return api.state.path?.worktree ?? session?.directory ?? session?.path
   return session?.directory ?? session?.path ?? api.state.path?.worktree ?? api.state.path?.directory
 }
 
