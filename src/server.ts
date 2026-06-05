@@ -41,6 +41,22 @@ interface WorktreeSessionSwitch {
 interface SessionInfo {
   id: string
   parentID?: string
+  title: string
+  agent?: string
+  model?: {
+    id: string
+    providerID: string
+    variant?: string
+  }
+}
+
+interface ContinuationPromptOptions {
+  agent?: string
+  model?: {
+    providerID: string
+    modelID: string
+  }
+  variant?: string
 }
 
 // --- Git helpers ---
@@ -292,13 +308,17 @@ async function switchWorktreeSession(args: WorktreeSessionSwitch) {
   })
 
   const originalSessionResult = await originalClient.session.get({ sessionID: args.sessionID, directory: projectRoot })
+  const sourceSession = originalSessionResult.error ? undefined : (originalSessionResult.data as SessionInfo)
+
+  const interruptResult = await originalClient.session.abort({ sessionID: args.sessionID, directory: projectRoot })
+  if (interruptResult.error) throw new Error(`Session interrupt failed: ${JSON.stringify(interruptResult.error)}`)
 
   const forkResult = await worktreeClient.session.fork({ sessionID: args.sessionID, directory: args.path })
   if (forkResult.error) throw new Error(`Fork failed: ${JSON.stringify(forkResult.error)}`)
 
   const newSessionID = forkResult.data.id
-  if (!originalSessionResult.error) {
-    const title = getWorktreeSessionTitle(args.branch, originalSessionResult.data.title)
+  if (sourceSession) {
+    const title = getWorktreeSessionTitle(args.branch, sourceSession.title)
     const updateResult = await worktreeClient.session.update({ sessionID: newSessionID, directory: args.path, title })
     if (updateResult.error) console.error("worktree_switch session title update failed", updateResult.error)
   }
@@ -311,10 +331,22 @@ async function switchWorktreeSession(args: WorktreeSessionSwitch) {
 
   const promptResult = await worktreeClient.session.promptAsync({
     sessionID: newSessionID,
+    directory: args.path,
+    ...getContinuationPromptOptions(sourceSession),
     parts: [{ type: "text", text: args.prompt ?? SWITCH_CONTINUATION_PROMPT, synthetic: true }],
   })
   if (promptResult.error) {
     throw new Error(`Session forked but continuation failed: ${JSON.stringify(promptResult.error)}; New session ID: ${newSessionID}`)
+  }
+}
+
+function getContinuationPromptOptions(session: SessionInfo | undefined): ContinuationPromptOptions {
+  if (!session) return {}
+
+  return {
+    ...(session.agent ? { agent: session.agent } : {}),
+    ...(session.model ? { model: { providerID: session.model.providerID, modelID: session.model.id } } : {}),
+    ...(session.model?.variant ? { variant: session.model.variant } : {}),
   }
 }
 
