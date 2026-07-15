@@ -13,6 +13,8 @@ const FINISH_CONTINUATION_PROMPT =
   "Worktree finalize is complete. Continue the user's latest request in the main project session. Do not call worktree_finish again."
 const ROOT_SWITCH_REQUIRED_MESSAGE =
   "Worktree switch blocked: only the root agent can switch worktrees. Ask the root agent to switch before starting subagents for work in this worktree."
+const TOOL_COMPLETION_POLL_MS = 5
+const TOOL_COMPLETION_TIMEOUT_MS = 2000
 const OPENCODE_DB_FILE = join(process.env.XDG_DATA_HOME ?? join(homedir(), ".local", "share"), "opencode", "opencode.db")
 const WORKTREE_TOOL_INSTRUCTIONS = [
   "Worktree operations:",
@@ -32,7 +34,9 @@ interface WorktreeSessionSwitch {
   branch: string
   path: string
   sessionID: string
-  projectDir: string
+  messageID: string
+  toolName: string
+  projectRoot: string
   baseUrl: string
   fetch: typeof globalThis.fetch
   prompt?: string
@@ -195,6 +199,10 @@ function updateSessionLocation(sessionID: string, directory: string): void {
   execFileSync("sqlite3", [OPENCODE_DB_FILE, sql], { stdio: ["ignore", "pipe", "pipe"] })
 }
 
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds))
+}
+
 // --- Tools ---
 
 function createWorktreeCreateTool(projectDir: string, inProcessFetch: typeof globalThis.fetch, baseUrl: string) {
@@ -234,11 +242,13 @@ function createWorktreeCreateTool(projectDir: string, inProcessFetch: typeof glo
       }
 
       if (shouldSwitch) {
-        await switchWorktreeSession({
+        scheduleWorktreeSessionSwitch({
           branch: args.branch,
           path: wtPath,
           sessionID: ctx.sessionID,
-          projectDir,
+          messageID: ctx.messageID,
+          toolName: "worktree_create",
+          projectRoot: repoRoot,
           baseUrl,
           fetch: inProcessFetch,
         })
@@ -295,7 +305,7 @@ async function canSwitchFromSession(baseUrl: string, fetch: typeof globalThis.fe
 }
 
 async function switchWorktreeSession(args: WorktreeSessionSwitch) {
-  const projectRoot = getMainWorktreeRoot(args.projectDir)
+  const projectRoot = args.projectRoot
   const originalClient = createV2Client({
     baseUrl: args.baseUrl,
     fetch: args.fetch,
@@ -309,6 +319,8 @@ async function switchWorktreeSession(args: WorktreeSessionSwitch) {
 
   const originalSessionResult = await originalClient.session.get({ sessionID: args.sessionID, directory: projectRoot })
   const sourceSession = originalSessionResult.error ? undefined : (originalSessionResult.data as SessionInfo)
+
+  await waitForToolCompletion(originalClient, args, projectRoot)
 
   const interruptResult = await originalClient.session.abort({ sessionID: args.sessionID, directory: projectRoot })
   if (interruptResult.error) throw new Error(`Session interrupt failed: ${JSON.stringify(interruptResult.error)}`)
@@ -338,6 +350,60 @@ async function switchWorktreeSession(args: WorktreeSessionSwitch) {
   if (promptResult.error) {
     throw new Error(`Session forked but continuation failed: ${JSON.stringify(promptResult.error)}; New session ID: ${newSessionID}`)
   }
+}
+
+async function waitForToolCompletion(
+  client: ReturnType<typeof createV2Client>,
+  args: WorktreeSessionSwitch,
+  projectRoot: string,
+): Promise<void> {
+  const deadline = Date.now() + TOOL_COMPLETION_TIMEOUT_MS
+
+  while (Date.now() < deadline) {
+    const result = await client.session.message({
+      sessionID: args.sessionID,
+      messageID: args.messageID,
+      directory: projectRoot,
+    })
+    if (result.error) throw new Error(`Tool completion lookup failed: ${JSON.stringify(result.error)}`)
+
+    const part = [...result.data.parts]
+      .reverse()
+      .find((candidate) => candidate.type === "tool" && candidate.tool === args.toolName)
+
+    if (part?.type === "tool" && part.state.status === "completed") return
+    if (part?.type === "tool" && part.state.status === "error") {
+      throw new Error(`${args.toolName} failed before session handoff: ${part.state.error}`)
+    }
+
+    await delay(TOOL_COMPLETION_POLL_MS)
+  }
+
+  throw new Error(`Timed out waiting for ${args.toolName} to complete before session handoff`)
+}
+
+function scheduleWorktreeSessionSwitch(args: WorktreeSessionSwitch): void {
+  void switchWorktreeSession(args).catch(async (error) => {
+    const message = getErrorMessage(error)
+    console.error("worktree session handoff failed", message)
+
+    try {
+      const client = createV2Client({
+        baseUrl: args.baseUrl,
+        fetch: args.fetch,
+        directory: args.projectRoot,
+      })
+      const result = await client.tui.showToast({
+        title: "Worktree switch failed",
+        message,
+        variant: "error",
+        duration: 8000,
+      })
+      if (result.error) console.error("worktree switch failure toast failed", result.error)
+    } catch (toastError) {
+      console.error("worktree switch failure toast failed", toastError)
+    }
+  })
 }
 
 function getContinuationPromptOptions(session: SessionInfo | undefined): ContinuationPromptOptions {
@@ -401,11 +467,13 @@ function createWorktreeSwitchTool(projectDir: string, inProcessFetch: typeof glo
         }
       }
 
-      await switchWorktreeSession({
+      scheduleWorktreeSessionSwitch({
         branch: args.branch,
         path: entry.path,
         sessionID: ctx.sessionID,
-        projectDir,
+        messageID: ctx.messageID,
+        toolName: "worktree_switch",
+        projectRoot: repoRoot,
         baseUrl,
         fetch: inProcessFetch,
       })
@@ -521,20 +589,18 @@ function createWorktreeFinishTool(projectDir: string, inProcessFetch: typeof glo
       const lines = [`Worktree '${targetBranch}' removed. Branch still exists for merge/PR.`]
 
       if (isCurrentWorktree) {
-        try {
-          await switchWorktreeSession({
-            branch: getCurrentBranch(repoRoot),
-            path: repoRoot,
-            sessionID: ctx.sessionID,
-            projectDir,
-            baseUrl,
-            fetch: inProcessFetch,
-            prompt: FINISH_CONTINUATION_PROMPT,
-          })
-          lines.push("", `Session switched back to main project. Stop here; continuation resumes in the main session.`)
-        } catch (error) {
-          lines.push("", `Main session switch failed: ${getErrorMessage(error)}`)
-        }
+        scheduleWorktreeSessionSwitch({
+          branch: getCurrentBranch(repoRoot),
+          path: repoRoot,
+          sessionID: ctx.sessionID,
+          messageID: ctx.messageID,
+          toolName: "worktree_finish",
+          projectRoot: repoRoot,
+          baseUrl,
+          fetch: inProcessFetch,
+          prompt: FINISH_CONTINUATION_PROMPT,
+        })
+        lines.push("", `Session switched back to main project. Stop here; continuation resumes in the main session.`)
       }
 
       return lines.join("\n")
